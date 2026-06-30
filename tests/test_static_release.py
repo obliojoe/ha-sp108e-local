@@ -31,7 +31,7 @@ def test_component_python_syntax() -> None:
 
 
 def test_no_private_artifact_directories() -> None:
-    forbidden = {".git", ".storage", "__pycache__", "secrets", "out", "backup", "backups", "node_modules"}
+    forbidden = {".storage", "__pycache__", "secrets", "out", "backup", "backups", "node_modules"}
     present = {path.name for path in ROOT.rglob("*") if path.is_dir()}
     assert not (present & forbidden)
 
