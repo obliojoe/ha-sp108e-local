@@ -1,0 +1,26 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "SP108E Local",
+        "description": "Connect to a SP108E/LED Shop controller over local TCP.",
+        "data": {
+          "host": "Host",
+          "port": "Port",
+          "name": "Name",
+          "timeout": "Timeout",
+          "scan_interval": "Scan interval",
+          "color_debounce": "Color debounce",
+          "rgb_order": "RGB order"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot connect to the controller.",
+      "unknown": "Unexpected error."
+    },
+    "abort": {
+      "already_configured": "This controller is already configured."
+    }
+  }
+}
