@@ -31,6 +31,7 @@ from .effects import EFFECTS, SOLID_EFFECT
 from .protocol import Sp108eClient, Sp108eError, Sp108eSettings
 
 _LOGGER = logging.getLogger(__name__)
+_COLOR_WRITE_SETTLE_SECONDS = 0.05
 
 _T = TypeVar("_T")
 
@@ -76,6 +77,10 @@ class Sp108eDataUpdateCoordinator(DataUpdateCoordinator[Sp108eSettings]):
         command_task = self._create_retained_task(self._async_run_command_locked(func, *args))
         return await asyncio.shield(command_task)
 
+    async def _run_color_attempt(self, device_rgb: tuple[int, int, int]) -> Sp108eSettings:
+        command_task = self._create_retained_task(self._async_run_color_attempt_locked(device_rgb))
+        return await asyncio.shield(command_task)
+
     def _create_retained_task(self, coroutine: Coroutine[Any, Any, _T]) -> asyncio.Task[_T]:
         task = self.hass.async_create_task(coroutine)
         self._retained_tasks.add(task)
@@ -112,6 +117,15 @@ class Sp108eDataUpdateCoordinator(DataUpdateCoordinator[Sp108eSettings]):
         async with self._command_lock:
             try:
                 return await self.hass.async_add_executor_job(func, *args)
+            except Sp108eError as err:
+                raise UpdateFailed(str(err)) from err
+
+    async def _async_run_color_attempt_locked(self, device_rgb: tuple[int, int, int]) -> Sp108eSettings:
+        async with self._command_lock:
+            try:
+                await self.hass.async_add_executor_job(self.client.set_color, *device_rgb)
+                await asyncio.sleep(_COLOR_WRITE_SETTLE_SECONDS)
+                return await self.hass.async_add_executor_job(self.client.get_settings)
             except Sp108eError as err:
                 raise UpdateFailed(str(err)) from err
 
@@ -166,6 +180,17 @@ class Sp108eDataUpdateCoordinator(DataUpdateCoordinator[Sp108eSettings]):
         except asyncio.CancelledError:
             return
 
+    async def _async_set_color_verified(self, rgb_color: tuple[int, int, int]) -> None:
+        device_rgb = map_rgb_to_device(rgb_color, self.rgb_order)
+        last_rgb: tuple[int, int, int] | None = None
+        for _attempt in range(2):
+            state = await self._run_color_attempt(device_rgb)
+            self.async_set_updated_data(state)
+            last_rgb = state.color_rgb
+            if last_rgb == device_rgb:
+                return
+        raise UpdateFailed(f"color readback mismatch after retry: expected {device_rgb}, got {last_rgb}")
+
     async def async_turn_on(
         self,
         brightness: int | None = None,
@@ -195,9 +220,7 @@ class Sp108eDataUpdateCoordinator(DataUpdateCoordinator[Sp108eSettings]):
                 if self.color_debounce > 0:
                     self._schedule_color(rgb_color)
                 else:
-                    device_rgb = map_rgb_to_device(rgb_color, self.rgb_order)
-                    await self._run_command(self.client.set_color, *device_rgb)
-                    await self.async_request_refresh()
+                    await self._async_set_color_verified(rgb_color)
             else:
                 await self.async_request_refresh()
 
