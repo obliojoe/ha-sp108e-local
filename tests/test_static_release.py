@@ -43,3 +43,10 @@ def test_required_public_files_exist() -> None:
     assert (component / "diagnostics.py").is_file()
     assert (component / "translations" / "en.json").is_file()
     assert (component / "translations" / "it.json").is_file()
+
+
+def test_unload_drains_coordinator_before_removal() -> None:
+    source = (ROOT / "custom_components" / "sp108e_local" / "__init__.py").read_text(encoding="utf-8")
+    drain = source.index("await coordinator.async_shutdown()")
+    removal = source.index("hass.data[DOMAIN].pop(entry.entry_id)")
+    assert drain < removal
