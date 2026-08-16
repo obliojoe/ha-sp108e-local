@@ -62,10 +62,7 @@ class Sp108eDataUpdateCoordinator(DataUpdateCoordinator[Sp108eSettings]):
         )
 
     async def _async_update_data(self) -> Sp108eSettings:
-        try:
-            return await self.hass.async_add_executor_job(self.client.get_settings)
-        except Sp108eError as err:
-            raise UpdateFailed(str(err)) from err
+        return await self._run_command(self.client.get_settings)
 
     async def _run_command(self, func: Callable[..., _T], *args: Any) -> _T:
         async with self._command_lock:
