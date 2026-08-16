@@ -5,6 +5,7 @@ import importlib
 import sys
 import threading
 import types
+from contextlib import suppress
 from pathlib import Path
 
 
@@ -37,6 +38,13 @@ def load_coordinator_module(monkeypatch):
             self.update_interval = update_interval
             self.data = None
             self.last_update_success = True
+            self.base_shutdown_called = False
+
+        def async_set_updated_data(self, data):
+            self.data = data
+
+        async def async_shutdown(self):
+            self.base_shutdown_called = True
 
     config_entries.ConfigEntry = ConfigEntry
     const.CONF_HOST = "host"
@@ -115,6 +123,108 @@ class BlockingColorClient:
     def set_color(self, _red, _green, _blue):
         self.color_started.set()
         self.release_color.wait(timeout=2)
+
+
+class ReplacementColorClient:
+    def __init__(self):
+        self._state_lock = threading.Lock()
+        self.active_calls = 0
+        self.max_active_calls = 0
+        self.set_color_calls = 0
+        self.physical_color = None
+        self.first_color_started = threading.Event()
+        self.second_color_started = threading.Event()
+        self.release_first_color = threading.Event()
+
+    def set_color(self, red, green, blue):
+        color = (red, green, blue)
+        with self._state_lock:
+            self.active_calls += 1
+            self.max_active_calls = max(self.max_active_calls, self.active_calls)
+            self.set_color_calls += 1
+            call_number = self.set_color_calls
+        if call_number == 1:
+            self.first_color_started.set()
+            self.release_first_color.wait(timeout=2)
+        else:
+            self.second_color_started.set()
+        self.physical_color = color
+        with self._state_lock:
+            self.active_calls -= 1
+
+
+class BlockingSpeedClient:
+    def __init__(self):
+        self.speed_started = threading.Event()
+        self.release_speed = threading.Event()
+
+    def set_speed(self, _speed):
+        self.speed_started.set()
+        self.release_speed.wait(timeout=2)
+
+
+class ToggleStateClient:
+    def __init__(self, off_state, on_state):
+        self.off_state = off_state
+        self.on_state = on_state
+        self.toggle_count = 0
+
+    def toggle_power(self):
+        self.toggle_count += 1
+        return self.on_state if self.toggle_count % 2 else self.off_state
+
+    def set_mode(self, _effect):
+        return None
+
+    def set_color(self, _red, _green, _blue):
+        return None
+
+
+class BlockingToggleStateClient(ToggleStateClient):
+    def __init__(self, off_state, on_state):
+        super().__init__(off_state, on_state)
+        self.first_toggle_started = threading.Event()
+        self.second_toggle_started = threading.Event()
+        self.release_first_toggle = threading.Event()
+
+    def toggle_power(self):
+        self.toggle_count += 1
+        if self.toggle_count == 1:
+            self.first_toggle_started.set()
+            self.release_first_toggle.wait(timeout=2)
+            return self.on_state
+        self.second_toggle_started.set()
+        return self.off_state
+
+    def get_settings(self):
+        return self.on_state if self.toggle_count % 2 else self.off_state
+
+
+class NoneResponseToggleClient(ToggleStateClient):
+    def __init__(self, off_state, on_state):
+        super().__init__(off_state, on_state)
+        self.physical_on = False
+
+    def toggle_power(self):
+        self.toggle_count += 1
+        self.physical_on = not self.physical_on
+        return None
+
+    def get_settings(self):
+        return self.on_state if self.physical_on else self.off_state
+
+
+class RecoveringNoneResponseToggleClient(NoneResponseToggleClient):
+    def __init__(self, off_state, on_state, error_type):
+        super().__init__(off_state, on_state)
+        self.error_type = error_type
+        self.settings_calls = 0
+
+    def get_settings(self):
+        self.settings_calls += 1
+        if self.settings_calls == 1:
+            raise self.error_type("settings timeout")
+        return super().get_settings()
 
 
 class AttemptRecordingLock:
@@ -200,3 +310,520 @@ def test_zero_debounce_turn_on_waits_for_color_write(monkeypatch):
         return returned_before_write_finished
 
     assert not asyncio.run(exercise_turn_on())
+
+
+def test_replacing_inflight_debounced_color_keeps_io_serialized(monkeypatch):
+    coordinator_module = load_coordinator_module(monkeypatch)
+
+    async def exercise_replacement():
+        coordinator = coordinator_module.Sp108eDataUpdateCoordinator(FakeHass(), FakeEntry())
+        coordinator.color_debounce = 0.001
+        client = ReplacementColorClient()
+        coordinator.client = client
+
+        async def refresh():
+            return None
+
+        coordinator.async_request_refresh = refresh
+        coordinator._schedule_color((10, 20, 30))
+        first_task = coordinator._pending_color_task
+        async with asyncio.timeout(1):
+            while not client.first_color_started.is_set():
+                await asyncio.sleep(0.001)
+
+        coordinator._schedule_color((40, 50, 60))
+        second_task = coordinator._pending_color_task
+        try:
+            async with asyncio.timeout(0.05):
+                while not client.second_color_started.is_set():
+                    await asyncio.sleep(0.001)
+        except TimeoutError:
+            pass
+
+        second_started_before_first_finished = client.second_color_started.is_set()
+        client.release_first_color.set()
+        if first_task is not None:
+            with suppress(asyncio.CancelledError):
+                await first_task
+        if second_task is not None:
+            await second_task
+        return (
+            second_started_before_first_finished,
+            client.max_active_calls,
+            client.physical_color,
+        )
+
+    second_started_early, max_active_calls, physical_color = asyncio.run(exercise_replacement())
+    assert not second_started_early
+    assert max_active_calls == 1
+    assert physical_color == (40, 50, 60)
+
+
+def test_turn_on_uses_toggle_response_as_current_power_state(monkeypatch):
+    coordinator_module = load_coordinator_module(monkeypatch)
+
+    def settings(power_raw):
+        return coordinator_module.Sp108eSettings(
+            power_raw=power_raw,
+            effect_raw=coordinator_module.EFFECTS[coordinator_module.SOLID_EFFECT],
+            speed_raw=1,
+            brightness_raw=255,
+            ic_type_raw=1,
+            led_count=1,
+            segment_count=1,
+            color_rgb=(0, 0, 255),
+            color_order_raw=1,
+            recorded_patterns_raw=0,
+            white_brightness_raw=0,
+        )
+
+    async def exercise_two_colors():
+        coordinator = coordinator_module.Sp108eDataUpdateCoordinator(FakeHass(), FakeEntry())
+        coordinator.color_debounce = 0
+        off_state = settings(0)
+        on_state = settings(1)
+        coordinator.data = off_state
+        client = ToggleStateClient(off_state, on_state)
+        coordinator.client = client
+
+        async def refresh():
+            return None
+
+        coordinator.async_request_refresh = refresh
+        await coordinator.async_turn_on(rgb_color=(0, 0, 255))
+        await coordinator.async_turn_on(rgb_color=(255, 180, 0))
+        return coordinator.data.is_on, client.toggle_count
+
+    is_on, toggle_count = asyncio.run(exercise_two_colors())
+    assert is_on
+    assert toggle_count == 1
+
+
+def test_concurrent_turn_on_calls_toggle_power_once(monkeypatch):
+    coordinator_module = load_coordinator_module(monkeypatch)
+
+    def settings(power_raw):
+        return coordinator_module.Sp108eSettings(
+            power_raw=power_raw,
+            effect_raw=coordinator_module.EFFECTS[coordinator_module.SOLID_EFFECT],
+            speed_raw=1,
+            brightness_raw=255,
+            ic_type_raw=1,
+            led_count=1,
+            segment_count=1,
+            color_rgb=(0, 0, 255),
+            color_order_raw=1,
+            recorded_patterns_raw=0,
+            white_brightness_raw=0,
+        )
+
+    async def exercise_concurrent_turn_on():
+        coordinator = coordinator_module.Sp108eDataUpdateCoordinator(FakeHass(), FakeEntry())
+        coordinator.color_debounce = 0
+        off_state = settings(0)
+        on_state = settings(1)
+        coordinator.data = off_state
+        client = BlockingToggleStateClient(off_state, on_state)
+        coordinator.client = client
+        command_lock = AttemptRecordingLock()
+        coordinator._command_lock = command_lock
+
+        async def refresh():
+            return None
+
+        coordinator.async_request_refresh = refresh
+        first = asyncio.create_task(coordinator.async_turn_on(rgb_color=(0, 0, 255)))
+        while not client.first_toggle_started.is_set():
+            await asyncio.sleep(0.001)
+        second = asyncio.create_task(coordinator.async_turn_on(rgb_color=(255, 180, 0)))
+        try:
+            await asyncio.wait_for(command_lock.second_attempt.wait(), timeout=0.05)
+        except TimeoutError:
+            pass
+        client.release_first_toggle.set()
+        await asyncio.gather(first, second)
+        return coordinator.data.is_on, client.toggle_count
+
+    is_on, toggle_count = asyncio.run(exercise_concurrent_turn_on())
+    assert is_on
+    assert toggle_count == 1
+
+
+def test_turn_off_uses_toggle_response_as_current_power_state(monkeypatch):
+    coordinator_module = load_coordinator_module(monkeypatch)
+
+    def settings(power_raw):
+        return coordinator_module.Sp108eSettings(
+            power_raw=power_raw,
+            effect_raw=coordinator_module.EFFECTS[coordinator_module.SOLID_EFFECT],
+            speed_raw=1,
+            brightness_raw=255,
+            ic_type_raw=1,
+            led_count=1,
+            segment_count=1,
+            color_rgb=(0, 0, 255),
+            color_order_raw=1,
+            recorded_patterns_raw=0,
+            white_brightness_raw=0,
+        )
+
+    async def exercise_turn_off():
+        coordinator = coordinator_module.Sp108eDataUpdateCoordinator(FakeHass(), FakeEntry())
+        off_state = settings(0)
+        on_state = settings(1)
+        coordinator.data = on_state
+        client = ToggleStateClient(off_state, on_state)
+        client.toggle_count = 1
+        initial_toggle_count = client.toggle_count
+        coordinator.client = client
+
+        async def refresh():
+            return None
+
+        coordinator.async_request_refresh = refresh
+        await coordinator.async_turn_off()
+        return coordinator.data.is_on, client.toggle_count - initial_toggle_count
+
+    is_on, toggle_calls = asyncio.run(exercise_turn_off())
+    assert not is_on
+    assert toggle_calls == 1
+
+
+def test_none_toggle_response_is_refreshed_before_next_turn_on(monkeypatch):
+    coordinator_module = load_coordinator_module(monkeypatch)
+
+    def settings(power_raw):
+        return coordinator_module.Sp108eSettings(
+            power_raw=power_raw,
+            effect_raw=coordinator_module.EFFECTS[coordinator_module.SOLID_EFFECT],
+            speed_raw=1,
+            brightness_raw=255,
+            ic_type_raw=1,
+            led_count=1,
+            segment_count=1,
+            color_rgb=(0, 0, 255),
+            color_order_raw=1,
+            recorded_patterns_raw=0,
+            white_brightness_raw=0,
+        )
+
+    async def exercise_none_response():
+        coordinator = coordinator_module.Sp108eDataUpdateCoordinator(FakeHass(), FakeEntry())
+        coordinator.color_debounce = 0.25
+        off_state = settings(0)
+        on_state = settings(1)
+        coordinator.data = off_state
+        client = NoneResponseToggleClient(off_state, on_state)
+        coordinator.client = client
+
+        async def refresh():
+            return None
+
+        coordinator.async_request_refresh = refresh
+        await coordinator.async_turn_on(rgb_color=(0, 0, 255))
+        await coordinator.async_turn_on(rgb_color=(255, 180, 0))
+        coordinator.cancel_pending_color()
+        return coordinator.data.is_on, client.physical_on, client.toggle_count
+
+    coordinator_on, physical_on, toggle_count = asyncio.run(exercise_none_response())
+    assert coordinator_on
+    assert physical_on
+    assert toggle_count == 1
+
+
+def test_cancelled_turn_on_does_not_release_power_transaction(monkeypatch):
+    coordinator_module = load_coordinator_module(monkeypatch)
+
+    def settings(power_raw):
+        return coordinator_module.Sp108eSettings(
+            power_raw=power_raw,
+            effect_raw=coordinator_module.EFFECTS[coordinator_module.SOLID_EFFECT],
+            speed_raw=1,
+            brightness_raw=255,
+            ic_type_raw=1,
+            led_count=1,
+            segment_count=1,
+            color_rgb=(0, 0, 255),
+            color_order_raw=1,
+            recorded_patterns_raw=0,
+            white_brightness_raw=0,
+        )
+
+    async def exercise_cancellation():
+        coordinator = coordinator_module.Sp108eDataUpdateCoordinator(FakeHass(), FakeEntry())
+        coordinator.color_debounce = 0
+        off_state = settings(0)
+        on_state = settings(1)
+        coordinator.data = off_state
+        client = BlockingToggleStateClient(off_state, on_state)
+        coordinator.client = client
+
+        async def refresh():
+            return None
+
+        coordinator.async_request_refresh = refresh
+        first = asyncio.create_task(coordinator.async_turn_on(rgb_color=(0, 0, 255)))
+        while not client.first_toggle_started.is_set():
+            await asyncio.sleep(0.001)
+        first.cancel()
+        with suppress(asyncio.CancelledError):
+            await first
+        second = asyncio.create_task(coordinator.async_turn_on(rgb_color=(255, 180, 0)))
+        try:
+            async with asyncio.timeout(0.05):
+                while not client.second_toggle_started.is_set():
+                    await asyncio.sleep(0.001)
+        except TimeoutError:
+            pass
+        client.release_first_toggle.set()
+        await second
+        return coordinator.data.is_on, client.toggle_count
+
+    is_on, toggle_count = asyncio.run(exercise_cancellation())
+    assert is_on
+    assert toggle_count == 1
+
+
+def test_failed_toggle_readback_is_reconciled_before_retry(monkeypatch):
+    coordinator_module = load_coordinator_module(monkeypatch)
+
+    def settings(power_raw):
+        return coordinator_module.Sp108eSettings(
+            power_raw=power_raw,
+            effect_raw=coordinator_module.EFFECTS[coordinator_module.SOLID_EFFECT],
+            speed_raw=1,
+            brightness_raw=255,
+            ic_type_raw=1,
+            led_count=1,
+            segment_count=1,
+            color_rgb=(0, 0, 255),
+            color_order_raw=1,
+            recorded_patterns_raw=0,
+            white_brightness_raw=0,
+        )
+
+    async def exercise_failed_readback():
+        coordinator = coordinator_module.Sp108eDataUpdateCoordinator(FakeHass(), FakeEntry())
+        coordinator.color_debounce = 0
+        off_state = settings(0)
+        on_state = settings(1)
+        coordinator.data = off_state
+        client = RecoveringNoneResponseToggleClient(off_state, on_state, coordinator_module.Sp108eError)
+        coordinator.client = client
+
+        async def refresh():
+            return None
+
+        coordinator.async_request_refresh = refresh
+        with suppress(coordinator_module.UpdateFailed):
+            await coordinator.async_turn_on(rgb_color=(0, 0, 255))
+        await coordinator.async_turn_on(rgb_color=(255, 180, 0))
+        return (
+            coordinator.data.is_on,
+            client.physical_on,
+            client.toggle_count,
+            client.settings_calls,
+        )
+
+    coordinator_on, physical_on, toggle_count, settings_calls = asyncio.run(exercise_failed_readback())
+    assert coordinator_on
+    assert physical_on
+    assert toggle_count == 1
+    assert settings_calls == 2
+
+
+def test_shutdown_drains_inflight_color_before_replacement_coordinator(monkeypatch):
+    coordinator_module = load_coordinator_module(monkeypatch)
+
+    async def exercise_reload():
+        old = coordinator_module.Sp108eDataUpdateCoordinator(FakeHass(), FakeEntry())
+        old.color_debounce = 0.001
+        client = ReplacementColorClient()
+        old.client = client
+
+        async def refresh():
+            return None
+
+        old.async_request_refresh = refresh
+        old._schedule_color((10, 20, 30))
+        async with asyncio.timeout(1):
+            while not client.first_color_started.is_set():
+                await asyncio.sleep(0.001)
+
+        try:
+            shutdown_task = asyncio.create_task(old.async_shutdown())
+        except AttributeError:
+            client.release_first_color.set()
+            raise
+        async with asyncio.timeout(1):
+            while not old._shutdown_started:
+                await asyncio.sleep(0.001)
+        late_operation_rejected = False
+        try:
+            await old.async_turn_on(rgb_color=(70, 80, 90))
+        except coordinator_module.UpdateFailed:
+            late_operation_rejected = True
+        await asyncio.sleep(0.01)
+        shutdown_waited_for_color = not shutdown_task.done()
+        client.release_first_color.set()
+        await shutdown_task
+
+        replacement = coordinator_module.Sp108eDataUpdateCoordinator(FakeHass(), FakeEntry())
+        replacement.client = client
+        await replacement._run_command(client.set_color, 40, 50, 60)
+        return (
+            shutdown_waited_for_color,
+            old.base_shutdown_called,
+            late_operation_rejected,
+            client.max_active_calls,
+            client.physical_color,
+        )
+
+    shutdown_waited, base_shutdown_called, late_rejected, max_active_calls, physical_color = asyncio.run(exercise_reload())
+    assert shutdown_waited
+    assert base_shutdown_called
+    assert late_rejected
+    assert max_active_calls == 1
+    assert physical_color == (40, 50, 60)
+
+
+def test_shutdown_drains_cancelled_toggle_before_replacement_coordinator(monkeypatch):
+    coordinator_module = load_coordinator_module(monkeypatch)
+
+    def settings(power_raw):
+        return coordinator_module.Sp108eSettings(
+            power_raw=power_raw,
+            effect_raw=coordinator_module.EFFECTS[coordinator_module.SOLID_EFFECT],
+            speed_raw=1,
+            brightness_raw=255,
+            ic_type_raw=1,
+            led_count=1,
+            segment_count=1,
+            color_rgb=(0, 0, 255),
+            color_order_raw=1,
+            recorded_patterns_raw=0,
+            white_brightness_raw=0,
+        )
+
+    async def exercise_reload():
+        old = coordinator_module.Sp108eDataUpdateCoordinator(FakeHass(), FakeEntry())
+        old.color_debounce = 0
+        off_state = settings(0)
+        on_state = settings(1)
+        old.data = off_state
+        client = BlockingToggleStateClient(off_state, on_state)
+        old.client = client
+
+        async def refresh():
+            return None
+
+        old.async_request_refresh = refresh
+        caller = asyncio.create_task(old.async_turn_on(rgb_color=(0, 0, 255)))
+        async with asyncio.timeout(1):
+            while not client.first_toggle_started.is_set():
+                await asyncio.sleep(0.001)
+        caller.cancel()
+        with suppress(asyncio.CancelledError):
+            await caller
+
+        try:
+            shutdown_task = asyncio.create_task(old.async_shutdown())
+        except AttributeError:
+            client.release_first_toggle.set()
+            raise
+        await asyncio.sleep(0.01)
+        shutdown_waited_for_toggle = not shutdown_task.done()
+        client.release_first_toggle.set()
+        await shutdown_task
+
+        replacement = coordinator_module.Sp108eDataUpdateCoordinator(FakeHass(), FakeEntry())
+        replacement.color_debounce = 0
+        replacement.client = client
+        replacement.async_request_refresh = refresh
+        replacement.data = await replacement._run_command(client.get_settings)
+        await replacement.async_turn_on(rgb_color=(255, 180, 0))
+        return shutdown_waited_for_toggle, replacement.data.is_on, client.toggle_count
+
+    shutdown_waited, is_on, toggle_count = asyncio.run(exercise_reload())
+    assert shutdown_waited
+    assert is_on
+    assert toggle_count == 1
+
+
+def test_shutdown_drains_complete_speed_operation(monkeypatch):
+    coordinator_module = load_coordinator_module(monkeypatch)
+
+    async def exercise_shutdown():
+        coordinator = coordinator_module.Sp108eDataUpdateCoordinator(FakeHass(), FakeEntry())
+        client = BlockingSpeedClient()
+        coordinator.client = client
+        refresh_started = asyncio.Event()
+        release_refresh = asyncio.Event()
+
+        async def refresh():
+            refresh_started.set()
+            await release_refresh.wait()
+
+        coordinator.async_request_refresh = refresh
+        speed_task = asyncio.create_task(coordinator.async_set_speed(120))
+        async with asyncio.timeout(1):
+            while not client.speed_started.is_set():
+                await asyncio.sleep(0.001)
+        shutdown_task = asyncio.create_task(coordinator.async_shutdown())
+        client.release_speed.set()
+        await asyncio.wait_for(refresh_started.wait(), timeout=1)
+        shutdown_waited_for_parent = not shutdown_task.done()
+        release_refresh.set()
+        await asyncio.gather(speed_task, shutdown_task)
+        return shutdown_waited_for_parent
+
+    assert asyncio.run(exercise_shutdown())
+
+
+def test_cancelled_shutdown_waiter_cannot_abandon_inflight_io(monkeypatch):
+    coordinator_module = load_coordinator_module(monkeypatch)
+
+    async def exercise_shutdown_cancellation():
+        coordinator = coordinator_module.Sp108eDataUpdateCoordinator(FakeHass(), FakeEntry())
+        coordinator.color_debounce = 0.001
+        client = ReplacementColorClient()
+        coordinator.client = client
+
+        async def refresh():
+            return None
+
+        coordinator.async_request_refresh = refresh
+        coordinator._schedule_color((10, 20, 30))
+        async with asyncio.timeout(1):
+            while not client.first_color_started.is_set():
+                await asyncio.sleep(0.001)
+
+        first_waiter = asyncio.create_task(coordinator.async_shutdown())
+        async with asyncio.timeout(1):
+            while not coordinator._shutdown_started:
+                await asyncio.sleep(0.001)
+        first_waiter.cancel()
+        with suppress(asyncio.CancelledError):
+            await first_waiter
+
+        second_waiter = asyncio.create_task(coordinator.async_shutdown())
+        await asyncio.sleep(0.01)
+        second_waiter_returned_before_io = second_waiter.done()
+        client.release_first_color.set()
+        await second_waiter
+
+        replacement = coordinator_module.Sp108eDataUpdateCoordinator(FakeHass(), FakeEntry())
+        replacement.client = client
+        await replacement._run_command(client.set_color, 40, 50, 60)
+        return (
+            second_waiter_returned_before_io,
+            coordinator._shutdown_complete,
+            client.max_active_calls,
+            client.physical_color,
+        )
+
+    returned_early, shutdown_complete, max_active_calls, physical_color = asyncio.run(exercise_shutdown_cancellation())
+    assert not returned_early
+    assert shutdown_complete
+    assert max_active_calls == 1
+    assert physical_color == (40, 50, 60)
