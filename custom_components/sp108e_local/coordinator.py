@@ -125,7 +125,12 @@ class Sp108eDataUpdateCoordinator(DataUpdateCoordinator[Sp108eSettings]):
         if brightness is not None:
             await self._run_command(self.client.set_brightness, brightness)
         if rgb_color is not None:
-            self._schedule_color(rgb_color)
+            if self.color_debounce > 0:
+                self._schedule_color(rgb_color)
+            else:
+                device_rgb = map_rgb_to_device(rgb_color, self.rgb_order)
+                await self._run_command(self.client.set_color, *device_rgb)
+                await self.async_request_refresh()
         else:
             await self.async_request_refresh()
 

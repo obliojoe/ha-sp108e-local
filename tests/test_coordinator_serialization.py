@@ -107,6 +107,16 @@ class OverlapDetectingClient:
         self._exit()
 
 
+class BlockingColorClient:
+    def __init__(self):
+        self.color_started = threading.Event()
+        self.release_color = threading.Event()
+
+    def set_color(self, _red, _green, _blue):
+        self.color_started.set()
+        self.release_color.wait(timeout=2)
+
+
 class AttemptRecordingLock:
     def __init__(self):
         self._lock = asyncio.Lock()
@@ -149,3 +159,44 @@ def test_periodic_read_and_color_write_share_one_io_lock(monkeypatch):
 
     assert not write_overlapped_read
     assert max_active_calls == 1
+
+
+def test_zero_debounce_turn_on_waits_for_color_write(monkeypatch):
+    coordinator_module = load_coordinator_module(monkeypatch)
+
+    async def exercise_turn_on():
+        coordinator = coordinator_module.Sp108eDataUpdateCoordinator(FakeHass(), FakeEntry())
+        coordinator.color_debounce = 0
+        coordinator.data = coordinator_module.Sp108eSettings(
+            power_raw=1,
+            effect_raw=coordinator_module.EFFECTS[coordinator_module.SOLID_EFFECT],
+            speed_raw=1,
+            brightness_raw=255,
+            ic_type_raw=1,
+            led_count=1,
+            segment_count=1,
+            color_rgb=(0, 0, 255),
+            color_order_raw=1,
+            recorded_patterns_raw=0,
+            white_brightness_raw=0,
+        )
+        client = BlockingColorClient()
+        coordinator.client = client
+
+        async def refresh():
+            return None
+
+        coordinator.async_request_refresh = refresh
+        turn_on_task = asyncio.create_task(coordinator.async_turn_on(rgb_color=(255, 180, 0)))
+        async with asyncio.timeout(1):
+            while not client.color_started.is_set():
+                await asyncio.sleep(0.001)
+
+        returned_before_write_finished = turn_on_task.done()
+        client.release_color.set()
+        await turn_on_task
+        if coordinator._pending_color_task is not None:
+            await coordinator._pending_color_task
+        return returned_before_write_finished
+
+    assert not asyncio.run(exercise_turn_on())
