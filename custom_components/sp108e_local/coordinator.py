@@ -31,7 +31,7 @@ from .effects import EFFECTS, SOLID_EFFECT
 from .protocol import Sp108eClient, Sp108eError, Sp108eSettings
 
 _LOGGER = logging.getLogger(__name__)
-_COLOR_WRITE_SETTLE_SECONDS = 0.05
+_WRITE_SETTLE_SECONDS = 0.05
 
 _T = TypeVar("_T")
 
@@ -77,6 +77,10 @@ class Sp108eDataUpdateCoordinator(DataUpdateCoordinator[Sp108eSettings]):
         command_task = self._create_retained_task(self._async_run_command_locked(func, *args))
         return await asyncio.shield(command_task)
 
+    async def _run_write_command(self, func: Callable[..., None], *args: Any) -> None:
+        command_task = self._create_retained_task(self._async_run_write_command_locked(func, *args))
+        await asyncio.shield(command_task)
+
     async def _run_color_attempt(self, device_rgb: tuple[int, int, int]) -> Sp108eSettings:
         command_task = self._create_retained_task(self._async_run_color_attempt_locked(device_rgb))
         return await asyncio.shield(command_task)
@@ -120,11 +124,19 @@ class Sp108eDataUpdateCoordinator(DataUpdateCoordinator[Sp108eSettings]):
             except Sp108eError as err:
                 raise UpdateFailed(str(err)) from err
 
+    async def _async_run_write_command_locked(self, func: Callable[..., None], *args: Any) -> None:
+        async with self._command_lock:
+            try:
+                await self.hass.async_add_executor_job(func, *args)
+                await asyncio.sleep(_WRITE_SETTLE_SECONDS)
+            except Sp108eError as err:
+                raise UpdateFailed(str(err)) from err
+
     async def _async_run_color_attempt_locked(self, device_rgb: tuple[int, int, int]) -> Sp108eSettings:
         async with self._command_lock:
             try:
                 await self.hass.async_add_executor_job(self.client.set_color, *device_rgb)
-                await asyncio.sleep(_COLOR_WRITE_SETTLE_SECONDS)
+                await asyncio.sleep(_WRITE_SETTLE_SECONDS)
                 return await self.hass.async_add_executor_job(self.client.get_settings)
             except Sp108eError as err:
                 raise UpdateFailed(str(err)) from err
@@ -175,7 +187,7 @@ class Sp108eDataUpdateCoordinator(DataUpdateCoordinator[Sp108eSettings]):
             if rgb_color is None:
                 return
             device_rgb = map_rgb_to_device(rgb_color, self.rgb_order)
-            await self._run_command(self.client.set_color, *device_rgb)
+            await self._run_write_command(self.client.set_color, *device_rgb)
             await self.async_request_refresh()
         except asyncio.CancelledError:
             return
@@ -211,11 +223,11 @@ class Sp108eDataUpdateCoordinator(DataUpdateCoordinator[Sp108eSettings]):
             if not state.is_on:
                 state = await self._async_toggle_power()
             if effect is not None:
-                await self._run_command(self.client.set_mode, EFFECTS[effect])
+                await self._run_write_command(self.client.set_mode, EFFECTS[effect])
             elif rgb_color is not None and state.effect_raw != EFFECTS[SOLID_EFFECT]:
-                await self._run_command(self.client.set_mode, EFFECTS[SOLID_EFFECT])
+                await self._run_write_command(self.client.set_mode, EFFECTS[SOLID_EFFECT])
             if brightness is not None:
-                await self._run_command(self.client.set_brightness, brightness)
+                await self._run_write_command(self.client.set_brightness, brightness)
             if rgb_color is not None:
                 if self.color_debounce > 0:
                     self._schedule_color(rgb_color)
@@ -241,5 +253,5 @@ class Sp108eDataUpdateCoordinator(DataUpdateCoordinator[Sp108eSettings]):
         await asyncio.shield(transaction)
 
     async def _async_set_speed_transaction(self, speed: int) -> None:
-        await self._run_command(self.client.set_speed, speed)
+        await self._run_write_command(self.client.set_speed, speed)
         await self.async_request_refresh()
