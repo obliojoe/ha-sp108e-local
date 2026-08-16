@@ -134,6 +134,27 @@ class SettleGapClient:
         return self.state
 
 
+class ConsecutiveWriteClient:
+    def __init__(self, initial_state):
+        self.state = initial_state
+        self.events = []
+
+    def set_mode(self, effect):
+        self.events.append(("mode", time.monotonic()))
+        self.state = replace(self.state, effect_raw=effect)
+
+    def set_brightness(self, brightness):
+        self.events.append(("brightness", time.monotonic()))
+        self.state = replace(self.state, brightness_raw=brightness)
+
+    def set_color(self, red, green, blue):
+        self.events.append(("color", time.monotonic()))
+        self.state = replace(self.state, color_rgb=(red, green, blue))
+
+    def get_settings(self):
+        return self.state
+
+
 class BlockingColorClient:
     def __init__(self, initial_state):
         self.state = initial_state
@@ -362,6 +383,42 @@ def test_periodic_read_cannot_enter_color_settle_gap(monkeypatch):
     assert not periodic_completed_early
     assert client.write_time is not None
     assert client.read_times[0] - client.write_time >= 0.045
+
+
+def test_consecutive_fire_and_forget_writes_are_paced(monkeypatch):
+    coordinator_module = load_coordinator_module(monkeypatch)
+
+    async def exercise_consecutive_writes():
+        coordinator = coordinator_module.Sp108eDataUpdateCoordinator(FakeHass(), FakeEntry())
+        coordinator.color_debounce = 0
+        coordinator.data = coordinator_module.Sp108eSettings(
+            power_raw=1,
+            effect_raw=coordinator_module.EFFECTS[coordinator_module.SOLID_EFFECT],
+            speed_raw=1,
+            brightness_raw=255,
+            ic_type_raw=1,
+            led_count=1,
+            segment_count=1,
+            color_rgb=(0, 0, 255),
+            color_order_raw=1,
+            recorded_patterns_raw=0,
+            white_brightness_raw=0,
+        )
+        client = ConsecutiveWriteClient(coordinator.data)
+        coordinator.client = client
+        await coordinator.async_turn_on(
+            effect=coordinator_module.SOLID_EFFECT,
+            brightness=242,
+            rgb_color=(255, 29, 0),
+        )
+        return client
+
+    client = asyncio.run(exercise_consecutive_writes())
+    assert [name for name, _timestamp in client.events] == ["mode", "brightness", "color"]
+    gaps = [later[1] - earlier[1] for earlier, later in zip(client.events, client.events[1:])]
+    assert all(gap >= 0.045 for gap in gaps)
+    assert client.state.brightness_raw == 242
+    assert client.state.color_rgb == (255, 29, 0)
 
 
 def test_zero_debounce_turn_on_waits_for_color_write(monkeypatch):
