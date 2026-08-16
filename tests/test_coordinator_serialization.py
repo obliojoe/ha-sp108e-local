@@ -4,8 +4,10 @@ import asyncio
 import importlib
 import sys
 import threading
+import time
 import types
 from contextlib import suppress
+from dataclasses import replace
 from pathlib import Path
 
 
@@ -115,14 +117,56 @@ class OverlapDetectingClient:
         self._exit()
 
 
+class SettleGapClient:
+    def __init__(self, initial_state):
+        self.state = initial_state
+        self.color_started = threading.Event()
+        self.write_time = None
+        self.read_times = []
+
+    def set_color(self, red, green, blue):
+        self.state = replace(self.state, color_rgb=(red, green, blue))
+        self.write_time = time.monotonic()
+        self.color_started.set()
+
+    def get_settings(self):
+        self.read_times.append(time.monotonic())
+        return self.state
+
+
 class BlockingColorClient:
-    def __init__(self):
+    def __init__(self, initial_state):
+        self.state = initial_state
         self.color_started = threading.Event()
         self.release_color = threading.Event()
 
-    def set_color(self, _red, _green, _blue):
+    def set_color(self, red, green, blue):
         self.color_started.set()
         self.release_color.wait(timeout=2)
+        self.state = replace(self.state, color_rgb=(red, green, blue))
+
+    def get_settings(self):
+        return self.state
+
+
+class DroppedFirstColorClient:
+    def __init__(self, initial_state):
+        self.state = initial_state
+        self.set_color_calls = 0
+        self.settings_calls = 0
+        self.write_times = []
+        self.read_times = []
+
+    def set_color(self, red, green, blue):
+        self.set_color_calls += 1
+        self.write_times.append(time.monotonic())
+        if self.set_color_calls > 1:
+            self.state = replace(self.state, color_rgb=(red, green, blue))
+
+    def get_settings(self):
+        self.settings_calls += 1
+        self.read_times.append(time.monotonic())
+        return self.state
 
 
 class ReplacementColorClient:
@@ -167,17 +211,25 @@ class ToggleStateClient:
     def __init__(self, off_state, on_state):
         self.off_state = off_state
         self.on_state = on_state
+        self.current_state = off_state
         self.toggle_count = 0
 
     def toggle_power(self):
         self.toggle_count += 1
-        return self.on_state if self.toggle_count % 2 else self.off_state
+        self.current_state = self.on_state if self.toggle_count % 2 else self.off_state
+        return self.current_state
 
     def set_mode(self, _effect):
         return None
 
-    def set_color(self, _red, _green, _blue):
-        return None
+    def set_color(self, red, green, blue):
+        color = (red, green, blue)
+        self.off_state = replace(self.off_state, color_rgb=color)
+        self.on_state = replace(self.on_state, color_rgb=color)
+        self.current_state = replace(self.current_state, color_rgb=color)
+
+    def get_settings(self):
+        return self.current_state
 
 
 class BlockingToggleStateClient(ToggleStateClient):
@@ -192,12 +244,14 @@ class BlockingToggleStateClient(ToggleStateClient):
         if self.toggle_count == 1:
             self.first_toggle_started.set()
             self.release_first_toggle.wait(timeout=2)
-            return self.on_state
+            self.current_state = self.on_state
+            return self.current_state
         self.second_toggle_started.set()
-        return self.off_state
+        self.current_state = self.off_state
+        return self.current_state
 
     def get_settings(self):
-        return self.on_state if self.toggle_count % 2 else self.off_state
+        return self.current_state
 
 
 class NoneResponseToggleClient(ToggleStateClient):
@@ -271,6 +325,45 @@ def test_periodic_read_and_color_write_share_one_io_lock(monkeypatch):
     assert max_active_calls == 1
 
 
+def test_periodic_read_cannot_enter_color_settle_gap(monkeypatch):
+    coordinator_module = load_coordinator_module(monkeypatch)
+
+    async def exercise_settle_gap():
+        coordinator = coordinator_module.Sp108eDataUpdateCoordinator(FakeHass(), FakeEntry())
+        coordinator.color_debounce = 0
+        coordinator.data = coordinator_module.Sp108eSettings(
+            power_raw=1,
+            effect_raw=coordinator_module.EFFECTS[coordinator_module.SOLID_EFFECT],
+            speed_raw=1,
+            brightness_raw=255,
+            ic_type_raw=1,
+            led_count=1,
+            segment_count=1,
+            color_rgb=(0, 0, 255),
+            color_order_raw=1,
+            recorded_patterns_raw=0,
+            white_brightness_raw=0,
+        )
+        client = SettleGapClient(coordinator.data)
+        coordinator.client = client
+
+        turn_on = asyncio.create_task(coordinator.async_turn_on(rgb_color=(255, 247, 5)))
+        async with asyncio.timeout(1):
+            while not client.color_started.is_set():
+                await asyncio.sleep(0.001)
+
+        periodic_read = asyncio.create_task(coordinator._async_update_data())
+        await asyncio.sleep(0.01)
+        periodic_completed_during_settle = periodic_read.done()
+        await asyncio.gather(turn_on, periodic_read)
+        return periodic_completed_during_settle, client
+
+    periodic_completed_early, client = asyncio.run(exercise_settle_gap())
+    assert not periodic_completed_early
+    assert client.write_time is not None
+    assert client.read_times[0] - client.write_time >= 0.045
+
+
 def test_zero_debounce_turn_on_waits_for_color_write(monkeypatch):
     coordinator_module = load_coordinator_module(monkeypatch)
 
@@ -290,7 +383,7 @@ def test_zero_debounce_turn_on_waits_for_color_write(monkeypatch):
             recorded_patterns_raw=0,
             white_brightness_raw=0,
         )
-        client = BlockingColorClient()
+        client = BlockingColorClient(coordinator.data)
         coordinator.client = client
 
         async def refresh():
@@ -310,6 +403,44 @@ def test_zero_debounce_turn_on_waits_for_color_write(monkeypatch):
         return returned_before_write_finished
 
     assert not asyncio.run(exercise_turn_on())
+
+
+def test_zero_debounce_waits_before_readback_and_retries_once_on_mismatch(monkeypatch):
+    coordinator_module = load_coordinator_module(monkeypatch)
+
+    async def exercise_dropped_color():
+        coordinator = coordinator_module.Sp108eDataUpdateCoordinator(FakeHass(), FakeEntry())
+        coordinator.color_debounce = 0
+        initial_state = coordinator_module.Sp108eSettings(
+            power_raw=1,
+            effect_raw=coordinator_module.EFFECTS[coordinator_module.SOLID_EFFECT],
+            speed_raw=1,
+            brightness_raw=255,
+            ic_type_raw=1,
+            led_count=1,
+            segment_count=1,
+            color_rgb=(0, 0, 255),
+            color_order_raw=1,
+            recorded_patterns_raw=0,
+            white_brightness_raw=0,
+        )
+        coordinator.data = initial_state
+        client = DroppedFirstColorClient(initial_state)
+        coordinator.client = client
+
+        async def refresh():
+            coordinator.async_set_updated_data(client.get_settings())
+
+        coordinator.async_request_refresh = refresh
+        await coordinator.async_turn_on(rgb_color=(255, 247, 5))
+        return client, coordinator.data
+
+    client, final_state = asyncio.run(exercise_dropped_color())
+    assert client.set_color_calls == 2
+    assert client.settings_calls == 2
+    assert client.state.color_rgb == (255, 247, 5)
+    assert final_state.color_rgb == (255, 247, 5)
+    assert all(read - write >= 0.045 for write, read in zip(client.write_times, client.read_times, strict=True))
 
 
 def test_replacing_inflight_debounced_color_keeps_io_serialized(monkeypatch):
@@ -629,7 +760,7 @@ def test_failed_toggle_readback_is_reconciled_before_retry(monkeypatch):
     assert coordinator_on
     assert physical_on
     assert toggle_count == 1
-    assert settings_calls == 2
+    assert settings_calls == 3  # Failed toggle readback, power reconciliation, verified color readback.
 
 
 def test_shutdown_drains_inflight_color_before_replacement_coordinator(monkeypatch):
